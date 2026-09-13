@@ -3,6 +3,9 @@
 // into a prompt loop for the chosen session.
 //
 // Usage: client <server_ip> <port> <token>
+//    or: client <server_ip> <port> @<token_file>   (reads the token's first
+//        line from a file instead of taking it as a plain argument, so it
+//        doesn't linger in shell history)
 
 #include <nlohmann/json.hpp>
 
@@ -12,6 +15,7 @@
 #include <unistd.h>
 
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -72,6 +76,14 @@ int main(int argc, char** argv) {
     std::string ip = argv[1];
     int port = std::atoi(argv[2]);
     std::string token = argv[3];
+    if (!token.empty() && token[0] == '@') {
+        std::ifstream tf(token.substr(1));
+        if (!tf) {
+            std::cerr << "cannot open token file: " << token.substr(1) << "\n";
+            return 1;
+        }
+        std::getline(tf, token);
+    }
 
     Conn conn;
     if (!conn.connect_to(ip, port)) {

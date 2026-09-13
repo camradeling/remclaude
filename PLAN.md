@@ -61,21 +61,33 @@ Newline-delimited JSON, one object per line, over a raw TCP socket.
   interface IP on the host machine, start `client` pointed at that IP from
   the other host.
 
-### Phase 2 — Hardening & running as an actual service
+### Phase 2 — Hardening & running as an actual service (done)
 
-Not yet implemented. Planned work:
-
-- Logging: request/response audit trail (timestamps, session name, prompt
-  length, cost, exit code) to a file — no prompt/response *content* in logs
-  by default, since that's sensitive by nature.
-- Config file instead of positional CLI args (bind IP, port, token,
-  registry path, project workdir) so secrets aren't visible in `ps`.
-- `systemd` unit (`remclaude.service`) so the server survives reboots and
-  restarts on crash; `WantedBy=multi-user.target`, `Restart=on-failure`.
-- Idle/orphan cleanup: optional max session count or max-age eviction so the
-  registry and transcript directory don't grow unbounded.
-- Basic connection hygiene: read/write timeouts, max line length (guard
-  against a client that never sends `\n`), max concurrent connections.
+- **Config file** (`config.example.json`) replaces positional CLI args —
+  `server <config.json>` — so the token never shows up in `ps`. Fields:
+  `bind_ip`, `port`, `token`, `project_workdir` (server `chdir`s here at
+  startup instead of relying on launch cwd), `registry_path`, `log_path`,
+  `max_connections`, `read_timeout_sec`, `max_line_bytes`,
+  `session_max_age_days`, `max_sessions`.
+- **Logging**: JSON-lines audit trail to `log_path` — connect/disconnect,
+  create/delete/prompt events, peer address, session name, prompt *byte
+  count* (never content), cost, ok/error. Startup and eviction events too.
+- **`systemd` unit** (`remclaude.service`, template — fill in user/paths):
+  `Restart=on-failure`, `WantedBy=multi-user.target`, `UMask=0077` so the
+  config file's token stays unreadable to other local users.
+- **Connection hygiene**: per-connection `SO_RCVTIMEO` read timeout, a
+  `max_line_bytes` cap that closes a connection sending an unterminated
+  line past that size, and a `max_connections` ceiling that rejects
+  (`"server busy, try again"`) rather than queuing once at capacity.
+- **Idle/orphan cleanup**: `session_max_age_days` evicts (registry entry +
+  transcript file) sessions not used recently, checked once at startup;
+  `max_sessions` caps the registry size and makes `create` fail closed
+  (asking you to delete something) instead of silently evicting a session
+  you might still want.
+- All of the above verified live: config-driven `project_workdir` chdir,
+  `@tokenfile` client auth, max-sessions rejection, age-based eviction
+  actually deleting transcripts, and a real third connection getting
+  rejected once `max_connections` was hit.
 
 ### Phase 3 — TLS + REST API (**implement later, not in scope now**)
 

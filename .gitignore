@@ -2,3 +2,5 @@ server
 client
 *.o
 remclaude_sessions.json
+remclaude.log
+config.json

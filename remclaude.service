@@ -1,0 +1,21 @@
+[Unit]
+Description=remclaude - remote Claude Code session server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace with the user this should run as, and the paths on your host.
+User=youruser
+Group=youruser
+WorkingDirectory=/home/youruser/remclaude
+ExecStart=/home/youruser/remclaude/server /home/youruser/remclaude/config.json
+Restart=on-failure
+RestartSec=5
+
+# The config file holds the shared auth token; keep it out of reach of
+# other users/services on the box.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

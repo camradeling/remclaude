@@ -1,0 +1,16 @@
+{
+  "bind_ip": "10.8.0.2",
+  "port": 8765,
+  "token": "REPLACE_WITH_A_LONG_RANDOM_TOKEN",
+
+  "project_workdir": "/home/youruser/remclaude-workdir",
+  "registry_path": "/var/lib/remclaude/sessions.json",
+  "log_path": "/var/log/remclaude/remclaude.log",
+
+  "max_connections": 8,
+  "read_timeout_sec": 300,
+  "max_line_bytes": 1048576,
+
+  "session_max_age_days": 30,
+  "max_sessions": 50
+}

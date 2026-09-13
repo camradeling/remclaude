@@ -12,10 +12,11 @@
 //   <- {"ok":true,"result":"...","is_error":false,"cost_usd":0.01}
 //   <- {"ok":false,"error":"..."}   (any command, on failure)
 //
-// Usage: server <bind_ip> <port> <token> [registry_path]
+// Usage: server <config.json>
+// See config.example.json for all fields.
 //
-// Run this from the directory whose Claude Code project bucket you want
-// sessions to live in (transcripts land under
+// Run this from (or point project_workdir at) the directory whose Claude
+// Code project bucket you want sessions to live in (transcripts land under
 // ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl).
 
 #include <nlohmann/json.hpp>
@@ -23,9 +24,11 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -47,13 +50,36 @@ namespace fs = std::filesystem;
 namespace {
 
 std::string g_project_dir;
-std::string g_token;
+
+struct Config {
+    std::string bind_ip;
+    int port = 0;
+    std::string token;
+    std::string project_workdir;  // empty = keep the server's own cwd
+    std::string registry_path = "remclaude_sessions.json";
+    std::string log_path = "remclaude.log";
+    int max_connections = 8;
+    int read_timeout_sec = 300;       // 0 disables the timeout
+    size_t max_line_bytes = 1 << 20;  // 1 MiB
+    int session_max_age_days = 0;     // 0 disables age-based eviction
+    int max_sessions = 0;             // 0 disables the cap
+};
+
+Config g_cfg;
 
 std::string now_iso() {
     std::time_t t = std::time(nullptr);
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
     return buf;
+}
+
+// Parses a "YYYY-MM-DDTHH:MM:SSZ" stamp (as produced by now_iso) into epoch
+// seconds, for age comparisons. Returns -1 on failure.
+long long parse_iso_to_epoch(const std::string& s) {
+    std::tm tm{};
+    if (strptime(s.c_str(), "%Y-%m-%dT%H:%M:%SZ", &tm) == nullptr) return -1;
+    return static_cast<long long>(timegm(&tm));
 }
 
 std::string gen_uuid() {
@@ -74,6 +100,27 @@ std::string gen_uuid() {
 fs::path transcript_path(const std::string& id) {
     return fs::path(g_project_dir) / (id + ".jsonl");
 }
+
+// Appends structured JSON-lines audit entries. Deliberately never logs
+// prompt/response *content* (only lengths/metadata) since that's sensitive
+// by nature.
+class Logger {
+public:
+    explicit Logger(std::string path) : path_(std::move(path)) {}
+
+    void log(json entry) {
+        entry["ts"] = now_iso();
+        std::lock_guard<std::mutex> lk(mtx_);
+        std::ofstream f(path_, std::ios::app);
+        f << entry.dump() << "\n";
+    }
+
+private:
+    std::string path_;
+    std::mutex mtx_;
+};
+
+std::unique_ptr<Logger> g_logger;
 
 struct RunResult {
     int exit_code = -1;
@@ -190,10 +237,20 @@ public:
         return sessions_;
     }
 
+    size_t count() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        return sessions_.size();
+    }
+
     bool create(const std::string& name, std::string& id_out, std::string& err) {
         std::lock_guard<std::mutex> lk(mtx_);
         if (find(name)) {
             err = "session name already exists";
+            return false;
+        }
+        if (g_cfg.max_sessions > 0 && static_cast<int>(sessions_.size()) >= g_cfg.max_sessions) {
+            err = "session limit reached (" + std::to_string(g_cfg.max_sessions) +
+                  "); delete an old one first";
             return false;
         }
         SessionInfo s;
@@ -235,6 +292,27 @@ public:
             }
         }
         return false;
+    }
+
+    // Removes every session whose last_used is older than max_age_days.
+    // Returns the removed sessions (name+id) so the caller can delete their
+    // transcript files and log what happened.
+    std::vector<SessionInfo> evict_older_than(int max_age_days) {
+        std::vector<SessionInfo> evicted;
+        if (max_age_days <= 0) return evicted;
+        long long cutoff = static_cast<long long>(std::time(nullptr)) - static_cast<long long>(max_age_days) * 86400;
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (auto it = sessions_.begin(); it != sessions_.end();) {
+            long long last = parse_iso_to_epoch(it->last_used);
+            if (last >= 0 && last < cutoff) {
+                evicted.push_back(*it);
+                it = sessions_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (!evicted.empty()) save();
+        return evicted;
     }
 
 private:
@@ -348,13 +426,47 @@ json handle_prompt(Registry& reg, const std::string& name, const std::string& te
             {"cost_usd", cj.value("total_cost_usd", 0.0)}};
 }
 
-void handle_client(int fd, Registry* reg) {
+// RAII guard so the active-connection counter is decremented on every exit
+// path (return, exception, thread end) without repeating the decrement.
+class ConnGuard {
+public:
+    explicit ConnGuard(std::atomic<int>& counter) : counter_(counter) {}
+    ~ConnGuard() { counter_.fetch_sub(1); }
+
+private:
+    std::atomic<int>& counter_;
+};
+
+void handle_client(int fd, Registry* reg, std::string peer, std::atomic<int>* active) {
+    ConnGuard guard(*active);
+
+    if (g_cfg.read_timeout_sec > 0) {
+        struct timeval tv{};
+        tv.tv_sec = g_cfg.read_timeout_sec;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+
     std::string buf;
     char tmp[4096];
     while (true) {
         ssize_t n = read(fd, tmp, sizeof(tmp));
-        if (n <= 0) break;
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                g_logger->log({{"event", "timeout"}, {"peer", peer}});
+            }
+            break;
+        }
+        if (n == 0) break;
         buf.append(tmp, n);
+
+        if (buf.size() > g_cfg.max_line_bytes && buf.find('\n') == std::string::npos) {
+            json resp = {{"ok", false}, {"error", "line too long"}};
+            send_line(fd, resp.dump() + "\n");
+            g_logger->log({{"event", "line_too_long"}, {"peer", peer}});
+            close(fd);
+            return;
+        }
+
         size_t pos;
         while ((pos = buf.find('\n')) != std::string::npos) {
             std::string line = buf.substr(0, pos);
@@ -365,59 +477,126 @@ void handle_client(int fd, Registry* reg) {
             try {
                 req = json::parse(line);
             } catch (...) {
-                json resp = {{"ok", false}, {"error", "invalid json"}};
-                std::string out = resp.dump() + "\n";
-                send_line(fd, out);
+                send_line(fd, json({{"ok", false}, {"error", "invalid json"}}).dump() + "\n");
                 continue;
             }
 
-            if (req.value("token", "") != g_token) {
-                json resp = {{"ok", false}, {"error", "unauthorized"}};
-                std::string out = resp.dump() + "\n";
-                send_line(fd, out);
+            if (req.value("token", "") != g_cfg.token) {
+                send_line(fd, json({{"ok", false}, {"error", "unauthorized"}}).dump() + "\n");
+                g_logger->log({{"event", "unauthorized"}, {"peer", peer}});
                 close(fd);
                 return;
             }
 
             std::string cmd = req.value("cmd", "");
+            std::string name = req.value("name", "");
             json resp;
-            if (cmd == "list") resp = handle_list(*reg);
-            else if (cmd == "create") resp = handle_create(*reg, req.value("name", ""));
-            else if (cmd == "delete") resp = handle_delete(*reg, req.value("name", ""));
-            else if (cmd == "prompt") resp = handle_prompt(*reg, req.value("name", ""), req.value("text", ""));
-            else resp = {{"ok", false}, {"error", "unknown cmd"}};
+            if (cmd == "list") {
+                resp = handle_list(*reg);
+            } else if (cmd == "create") {
+                resp = handle_create(*reg, name);
+            } else if (cmd == "delete") {
+                resp = handle_delete(*reg, name);
+            } else if (cmd == "prompt") {
+                std::string text = req.value("text", "");
+                resp = handle_prompt(*reg, name, text);
+                g_logger->log({{"event", "prompt"},
+                                {"peer", peer},
+                                {"session", name},
+                                {"prompt_bytes", text.size()},
+                                {"ok", resp.value("ok", false)},
+                                {"cost_usd", resp.value("cost_usd", 0.0)}});
+            } else {
+                resp = {{"ok", false}, {"error", "unknown cmd"}};
+            }
 
-            std::string out = resp.dump() + "\n";
-            send_line(fd, out);
+            if (cmd == "create" || cmd == "delete")
+                g_logger->log({{"event", cmd}, {"peer", peer}, {"session", name}, {"ok", resp.value("ok", false)}});
+
+            send_line(fd, resp.dump() + "\n");
         }
     }
     close(fd);
 }
 
+bool load_config(const std::string& path, std::string& err) {
+    std::ifstream f(path);
+    if (!f) {
+        err = "cannot open config file: " + path;
+        return false;
+    }
+    json j;
+    try {
+        f >> j;
+    } catch (std::exception& e) {
+        err = std::string("invalid config json: ") + e.what();
+        return false;
+    }
+    if (!j.contains("bind_ip") || !j.contains("port") || !j.contains("token")) {
+        err = "config must set bind_ip, port, and token";
+        return false;
+    }
+    g_cfg.bind_ip = j.value("bind_ip", "");
+    g_cfg.port = j.value("port", 0);
+    g_cfg.token = j.value("token", "");
+    g_cfg.project_workdir = j.value("project_workdir", g_cfg.project_workdir);
+    g_cfg.registry_path = j.value("registry_path", g_cfg.registry_path);
+    g_cfg.log_path = j.value("log_path", g_cfg.log_path);
+    g_cfg.max_connections = j.value("max_connections", g_cfg.max_connections);
+    g_cfg.read_timeout_sec = j.value("read_timeout_sec", g_cfg.read_timeout_sec);
+    g_cfg.max_line_bytes = j.value("max_line_bytes", g_cfg.max_line_bytes);
+    g_cfg.session_max_age_days = j.value("session_max_age_days", g_cfg.session_max_age_days);
+    g_cfg.max_sessions = j.value("max_sessions", g_cfg.max_sessions);
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 4) {
-        std::cerr << "usage: " << argv[0] << " <bind_ip> <port> <token> [registry_path]\n";
-        std::cerr << "  run from the directory you want sessions associated with\n";
+    if (argc != 2) {
+        std::cerr << "usage: " << argv[0] << " <config.json>\n";
+        std::cerr << "see config.example.json for the format\n";
         return 1;
     }
-    std::string bind_ip = argv[1];
-    int port = std::atoi(argv[2]);
-    g_token = argv[3];
-    std::string registry_path = argc > 4 ? argv[4] : "remclaude_sessions.json";
+
+    std::string err;
+    if (!load_config(argv[1], err)) {
+        std::cerr << "FATAL: " << err << "\n";
+        return 1;
+    }
 
     signal(SIGPIPE, SIG_IGN);
 
+    if (!g_cfg.project_workdir.empty()) {
+        std::error_code ec;
+        fs::current_path(g_cfg.project_workdir, ec);
+        if (ec) {
+            std::cerr << "FATAL: cannot chdir to project_workdir '" << g_cfg.project_workdir << "': " << ec.message()
+                       << "\n";
+            return 1;
+        }
+    }
+
+    g_logger = std::make_unique<Logger>(g_cfg.log_path);
+
     std::cerr << "Calibrating project directory (one-time throwaway claude call)...\n";
-    std::string err;
     if (!discover_project_dir(err)) {
         std::cerr << "FATAL: " << err << "\n";
         return 1;
     }
     std::cerr << "Project directory: " << g_project_dir << "\n";
 
-    Registry reg(registry_path);
+    Registry reg(g_cfg.registry_path);
+
+    if (g_cfg.session_max_age_days > 0) {
+        auto evicted = reg.evict_older_than(g_cfg.session_max_age_days);
+        for (auto& s : evicted) {
+            std::error_code ec;
+            fs::remove(transcript_path(s.id), ec);
+            g_logger->log({{"event", "evicted"}, {"session", s.name}, {"last_used", s.last_used}});
+            std::cerr << "Evicted stale session '" << s.name << "' (last used " << s.last_used << ")\n";
+        }
+    }
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
@@ -425,9 +604,9 @@ int main(int argc, char** argv) {
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, bind_ip.c_str(), &addr.sin_addr) != 1) {
-        std::cerr << "invalid bind ip: " << bind_ip << "\n";
+    addr.sin_port = htons(g_cfg.port);
+    if (inet_pton(AF_INET, g_cfg.bind_ip.c_str(), &addr.sin_addr) != 1) {
+        std::cerr << "invalid bind ip: " << g_cfg.bind_ip << "\n";
         return 1;
     }
     if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
@@ -438,13 +617,30 @@ int main(int argc, char** argv) {
         perror("listen");
         return 1;
     }
-    std::cerr << "Listening on " << bind_ip << ":" << port << "\n";
+    std::cerr << "Listening on " << g_cfg.bind_ip << ":" << g_cfg.port << "\n";
+    g_logger->log({{"event", "startup"}, {"bind_ip", g_cfg.bind_ip}, {"port", g_cfg.port}});
+
+    std::atomic<int> active_connections{0};
 
     while (true) {
         sockaddr_in client_addr{};
         socklen_t len = sizeof(client_addr);
         int cfd = accept(sock, reinterpret_cast<sockaddr*>(&client_addr), &len);
         if (cfd < 0) continue;
-        std::thread(handle_client, cfd, &reg).detach();
+
+        char ipbuf[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &client_addr.sin_addr, ipbuf, sizeof(ipbuf));
+        std::string peer = std::string(ipbuf) + ":" + std::to_string(ntohs(client_addr.sin_port));
+
+        if (active_connections.load() >= g_cfg.max_connections) {
+            send_line(cfd, json({{"ok", false}, {"error", "server busy, try again"}}).dump() + "\n");
+            g_logger->log({{"event", "rejected_busy"}, {"peer", peer}});
+            close(cfd);
+            continue;
+        }
+
+        active_connections.fetch_add(1);
+        g_logger->log({{"event", "connect"}, {"peer", peer}});
+        std::thread(handle_client, cfd, &reg, peer, &active_connections).detach();
     }
 }
