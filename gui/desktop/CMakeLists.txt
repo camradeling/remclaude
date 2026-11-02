@@ -1,0 +1,2 @@
+qt_add_executable(remclaude_gui main.cpp)
+remclaude_setup_target(remclaude_gui)

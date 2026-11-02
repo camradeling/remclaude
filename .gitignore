@@ -4,3 +4,16 @@ client
 remclaude_sessions.json
 remclaude.log
 config.json
+gui/build/
+gui/build-android/
+
+# Secrets — never commit
+token.txt
+*.token
+config.json
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+id_ecdsa*
+known_hosts

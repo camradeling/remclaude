@@ -1,0 +1,4 @@
+[submodule "gui/third_party/android_openssl"]
+	path = gui/third_party/android_openssl
+	url = https://github.com/KDAB/android_openssl.git
+	shallow = true

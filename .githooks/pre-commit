@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Pre-commit secret / private-info scan.
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+# Bypass (deliberately):   git commit --no-verify
+# False positive on a line: add a regex matching it to .githooks/secret-allowlist
+#
+# Checks only what is being committed: staged file names, and the lines
+# added in the staged diff.
+
+set -u
+ROOT=$(git rev-parse --show-toplevel)
+ALLOW="$ROOT/.githooks/secret-allowlist"
+fail=0
+
+report() {  # $1 = category, $2 = location, $3 = detail
+    printf '  \033[31m%-18s\033[0m %s  %s\n' "$1" "$2" "$3"
+    fail=1
+}
+
+# ── 1. Forbidden file names ──────────────────────────────────────────────────
+while IFS= read -r f; do
+    base=${f##*/}
+    case "$base" in
+        token.txt|*.token|config.json|*.pem|*.key|*.p12|*.pfx|*.keystore|*.jks|\
+        id_rsa*|id_ed25519*|id_ecdsa*|id_dsa*|known_hosts|authorized_keys|\
+        .env|.env.*|*.ovpn|credentials*|.credentials*)
+            report "secret file" "$f" "(file name looks like a credential)";;
+    esac
+done < <(git diff --cached --name-only --diff-filter=ACMR)
+
+# ── 2. Added lines ───────────────────────────────────────────────────────────
+patterns=(
+    'private key|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+    'ssh public key|ssh-(ed25519|rsa|dss|ecdsa-[a-z0-9-]+) AAAA[A-Za-z0-9+/]{20,}'
+    'api token|(ghp_|gho_|github_pat_|glpat-|sk-ant-|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[abpr]-)[A-Za-z0-9_-]+'
+    'long hex secret|(^|[^0-9a-fA-F])[0-9a-fA-F]{32,}([^0-9a-fA-F]|$)'
+    'json secret|"(token|password|passwd|secret|api_key|apikey)" *: *"[^".]{6,}"'
+    'home path|/home/[a-z_][a-z0-9_-]*/'
+    'private IP|(^|[^0-9.])(10\.[0-9]{1,3}|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\.[0-9]{1,3}\.[0-9]{1,3}'
+    'email|[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]*[a-z]{2,}'
+)
+# Always-fine matches: documentation placeholders and well-known addresses.
+builtin_allow='^Subproject commit [0-9a-f]{40}$|/home/youruser/|10\.8\.0\.2|192\.168\.1\.10|git@github\.com|noreply@anthropic\.com|"token":"\.\.\."|"REPLACE_WITH'
+
+file=""
+lineno=0
+while IFS= read -r line; do
+    case "$line" in
+        '+++ b/'*) file=${line#+++ b/}; continue;;
+        '+++ '*)   file=""; continue;;
+        '@@ '*)    lineno=$(sed -E 's/^@@ -[0-9,]+ \+([0-9]+).*/\1/' <<<"$line"); continue;;
+        '+'*)      ;;
+        *)         continue;;
+    esac
+    text=${line#+}
+    [ -n "$file" ] || continue
+    # Strip only the allowed substrings, so a secret on the same line still matches.
+    checked=$(sed -E "s#${builtin_allow}##g" <<<"$text")
+    for p in "${patterns[@]}"; do
+        name=${p%%|*}; re=${p#*|}
+        if grep -qE -- "$re" <<<"$checked"; then
+            if [ -f "$ALLOW" ] && grep -vE '^\s*(#|$)' "$ALLOW" | grep -qE -f - <<<"$text"; then
+                continue
+            fi
+            report "$name" "$file:$lineno" "$(cut -c1-100 <<<"$text" | sed -E 's/[0-9a-fA-F]{24,}/<hex…>/g')"
+        fi
+    done
+    lineno=$((lineno + 1))
+done < <(git diff --cached -U0 --no-color --diff-filter=ACMR -- . ':(exclude).githooks/pre-commit')
+
+if [ $fail -ne 0 ]; then
+    echo
+    echo "pre-commit: possible secrets / private info in the staged changes (above)."
+    echo "  Remove them, or allowlist a false positive in .githooks/secret-allowlist,"
+    echo "  or bypass deliberately with: git commit --no-verify"
+    exit 1
+fi
+exit 0
